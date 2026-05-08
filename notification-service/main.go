@@ -107,6 +107,15 @@ func main() {
 				continue
 			}
 
+
+			if event.OrderID == "fail"{
+				log.Printf("Simulating permanent error for Order #fail")
+				// requeue=false отправляет сообщение в DLQ
+				if err := d.Nack(false, false); err != nil {
+					log.Printf("Error nacking message: %v", err)
+				}
+				continue
+			}
 			// Проверка идемпотентности
 			if _, loaded := processedOrders.LoadOrStore(event.OrderID, true); loaded {
 				log.Printf("Duplicate message detected for Order #%s, skipping...", event.OrderID)
