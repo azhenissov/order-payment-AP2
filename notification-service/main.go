@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -9,6 +11,8 @@ import (
 	"syscall"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"notification-service/internal/domain"
+	"notification-service/internal/infrastructure"
 )
 
 // Структура сообщения согласно заданию
@@ -83,6 +87,22 @@ func main() {
 		log.Fatalf("Failed to declare queue: %v", err)
 	}
 
+	var emailSender domain.EmailSender
+	providerMode := os.Getenv("PROVIDER_MODE")
+
+	if providerMode == "REAL" {
+		log.Println("Starting Notification Service with REAL SMTP Provider")
+		emailSender = infrastructure.NewSMTPSender(
+			os.Getenv("SMTP_HOST"),
+			os.Getenv("SMTP_PORT"),
+			os.Getenv("SMTP_USER"),
+			os.Getenv("SMTP_PASS"),
+		)
+	} else {
+		log.Println("Starting Notification Service with SIMULATED Provider")
+		emailSender = infrastructure.NewSimulatedSender()
+	}
+
 	// Идемпотентность In-memory store для отслеживания обработанных ID
 	var processedOrders sync.Map
 
@@ -123,6 +143,17 @@ func main() {
 				continue
 			}
 
+			subject := fmt.Sprintf("Update on your Order #%s", event.OrderID)
+			body := fmt.Sprintf("Hello, your order status is: %s. Amount: %.2f", event.Status, event.Amount)
+
+			// Вызываем отправку письма
+			err := emailSender.SendEmail(context.Background(), event.CustomerEmail, subject, body)
+			
+			if err != nil {
+				log.Printf("[Notification] Provider error %v, ", err)
+				d.Nack(false, false)
+				continue
+			}
 			//  отправкa email
 			log.Printf("[Notification] Sent email to %s for Order #%s. Amount: $%.2f", 
                 event.CustomerEmail, event.OrderID, event.Amount)

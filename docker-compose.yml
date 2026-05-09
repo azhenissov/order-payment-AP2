@@ -115,8 +115,7 @@ services:
     environment:
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
       REDIS_URL: "redis://redis:6379"
-      PROVIDER_MODE: REAL
-      
+      PROVIDER_MODE: ${PROVIDER_MODE}
 volumes:
   order_data:
   payment_data:
