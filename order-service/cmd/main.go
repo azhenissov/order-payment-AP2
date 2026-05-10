@@ -12,6 +12,7 @@ import (
 	"order-service/internal/api"
 	"order-service/internal/repository"
 	"order-service/internal/service"
+	"order-service/internal/api/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -126,6 +127,8 @@ func main() {
 	// Передаем брокер в UseCase
 	orderUC := service.NewOrderUseCase(orderRepo, paymentClient, broker, orderCache, ttlMinutes)
 
+
+
 	// 4. Start gRPC Server for Order Service (in separate goroutine)
 	grpcPort := os.Getenv("ORDER_GRPC_PORT")
 	if grpcPort == "" {
@@ -156,10 +159,17 @@ func main() {
 	}
 
 	router := gin.Default()
+
+	limit := 10
+	window := 1*time.Minute
+
+	router.Use(middleware.RateLimiter(rdb, limit, window))
+
 	api.NewOrderHandler(router, orderUC)
 
 	log.Println()
 	log.Println("✓ External API: REST (Gin) - for users")
+	log.Println("✓ Rate Limiter: 10 requests per minute")
 	log.Println("✓ Internal API: gRPC - for service-to-service communication")
 	log.Println("✓ Streaming: Server-side streaming for order updates")
 	log.Println("  Proto Contracts: github.com/azhenissov/grpc-contracts-go/*_v1")
