@@ -82,15 +82,13 @@ func main() {
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
-		log.Fatal("REDIS_URL not set")
+		log.Println("Warning: REDIS_URL is empty, defaulting to redis:6379")
+		redisURL = "redis:6379"
 	}
 
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		log.Fatalf("Failed to parse REDIS_URL: %v", err)
-	}
-
-	rdb := redis.NewClient(opts)
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
 
 	var redisErr error
 	for i := 0; i < 5; i++ {

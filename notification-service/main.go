@@ -1,18 +1,21 @@
 package main
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"sync"
+	"strconv"
 	"syscall"
+	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"notification-service/internal/domain"
 	"notification-service/internal/infrastructure"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
 
 // Структура сообщения согласно заданию
@@ -24,7 +27,25 @@ type OrderEvent struct {
 }
 
 func main() {
-	// 1. Подключение к RabbitMQ
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == ""{
+		log.Fatal("REDIS_URL is not set")
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+
+	for i := 0; i < 5; i++{
+		if err := rdb.Ping(context.Background()).Err(); err == nil {
+			log.Println("✓ Redis connected successfully")
+			break
+		}
+		log.Printf("Failed to connect to Redis, retrying in 2s... (%d/5)", i+1)
+		time.Sleep(2 * time.Second)
+	}
+	defer rdb.Close()
+
 	conn, err := amqp.Dial(os.Getenv("RABBITMQ_URL"))
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
@@ -103,8 +124,13 @@ func main() {
 		emailSender = infrastructure.NewSimulatedSender()
 	}
 
+	maxRetriesStr := os.Getenv("RETRY_MAX_ATTEMPTS")
+	maxRetries, err := strconv.Atoi(maxRetriesStr)
+	if err != nil || maxRetries <= 0 {
+		maxRetries = 3 
+	}
+
 	// Идемпотентность In-memory store для отслеживания обработанных ID
-	var processedOrders sync.Map
 
 	// Потребление сообщений Manual Ack
 	msgs, err := ch.Consume(
@@ -127,44 +153,73 @@ func main() {
 				continue
 			}
 
-
-			if event.OrderID == "fail"{
+			// Оставляем твой тест для DLQ
+			if event.OrderID == "fail" {
 				log.Printf("Simulating permanent error for Order #fail")
-				// requeue=false отправляет сообщение в DLQ
 				if err := d.Nack(false, false); err != nil {
 					log.Printf("Error nacking message: %v", err)
 				}
 				continue
 			}
-			// Проверка идемпотентности
-			if _, loaded := processedOrders.LoadOrStore(event.OrderID, true); loaded {
-				log.Printf("Duplicate message detected for Order #%s, skipping...", event.OrderID)
-				d.Ack(false) 
+
+			// --- 1. REDIS IDEMPOTENCY ---
+			// Используем SETNX (Set if Not eXists). Если ключ уже есть, isNew будет false.
+			idempotencyKey := fmt.Sprintf("processed_order:%s", event.OrderID)
+			isNew, err := rdb.SetNX(context.Background(), idempotencyKey, "processed", 24*time.Hour).Result()
+			
+			if err != nil {
+				// Если сам Redis упал, мы не откидываем сообщение в DLQ, а возвращаем в очередь (requeue=true)
+				log.Printf("Redis error checking idempotency: %v", err)
+				d.Nack(false, true) 
+				continue
+			}
+
+			if !isNew {
+				log.Printf("Duplicate message detected in Redis for Order #%s, skipping...", event.OrderID)
+				d.Ack(false)
 				continue
 			}
 
 			subject := fmt.Sprintf("Update on your Order #%s", event.OrderID)
 			body := fmt.Sprintf("Hello, your order status is: %s. Amount: %.2f", event.Status, event.Amount)
 
-			// Вызываем отправку письма
-			err := emailSender.SendEmail(context.Background(), event.CustomerEmail, subject, body)
+			var sendErr error
+			maxRetries := 3
 			
-			if err != nil {
-				log.Printf("[Notification] Provider error %v, ", err)
-				d.Nack(false, false)
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				sendErr = emailSender.SendEmail(context.Background(), event.CustomerEmail, subject, body)
+				
+				if sendErr == nil {
+					break 
+				}
+
+				log.Printf("[Notification] Provider error on attempt %d: %v", attempt, sendErr)
+				
+				if attempt < maxRetries {
+					backoffDuration := time.Duration(1<<attempt) * time.Second 
+					log.Printf("Retrying in %v...", backoffDuration)
+					time.Sleep(backoffDuration)
+				}
+			}
+
+			if sendErr != nil {
+				log.Printf("Failed to process Order #%s after %d attempts. Sending to DLQ.", event.OrderID, maxRetries)
+				
+				rdb.Del(context.Background(), idempotencyKey) 
+				
+				d.Nack(false, false) 
 				continue
 			}
-			//  отправкa email
-			log.Printf("[Notification] Sent email to %s for Order #%s. Amount: $%.2f", 
-                event.CustomerEmail, event.OrderID, event.Amount)
 
-			// Подтверждение после успешной обработки
+			
+			log.Printf("[Notification] Sent email to %s for Order #%s. Amount: $%.2f", 
+				event.CustomerEmail, event.OrderID, event.Amount)
+
 			if err := d.Ack(false); err != nil {
 				log.Printf("Error acknowledging: %v", err)
 			}
 		}
 	}()
-
 	log.Printf("Notification Service is running. Waiting for events...")
 	<-sigChan 
 	log.Println("Shutting down gracefully...")
