@@ -96,7 +96,7 @@ services:
       ORDER_GRPC_PORT: :9091
       PAYMENT_GRPC_ADDRESS: payment-service:9090
       DATABASE_URL: "postgres://order_user:order_password@order_db:5432/orders_db?sslmode=disable"
-      REDIS_URL: "redis://redis:6379"
+      REDIS_URL: "${REDIS_URL}"
       CACHE_TTL_MINUTES: 5
     ports:
       - "8080:8080"
@@ -114,7 +114,7 @@ services:
         condition: service_healthy
     environment:
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
-      REDIS_URL: "redis://redis:6379"
+      REDIS_URL: "${REDIS_URL}"
       PROVIDER_MODE: ${PROVIDER_MODE}
 volumes:
   order_data:
