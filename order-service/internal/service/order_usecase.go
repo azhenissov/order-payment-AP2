@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt" // Добавлено для fmt.Errorf
+	"fmt"
 	"log"
 	"time"
 
@@ -24,13 +24,17 @@ type orderUseCase struct {
 	repo          domain.OrderRepository
 	paymentClient domain.PaymentClient
 	broker        *OrderBroker
+	cache         domain.OrderCache
+	ttl           time.Duration
 }
 
-func NewOrderUseCase(repo domain.OrderRepository, paymentClient domain.PaymentClient, broker *OrderBroker) domain.OrderUseCase {
+func NewOrderUseCase(repo domain.OrderRepository, paymentClient domain.PaymentClient, broker *OrderBroker, cache domain.OrderCache, ttlMinutes int) domain.OrderUseCase {
 	return &orderUseCase{
 		repo:          repo,
 		paymentClient: paymentClient,
 		broker:        broker,
+		cache:         cache,
+		ttl:           time.Duration(ttlMinutes) * time.Minute,
 	}
 }
 
@@ -82,20 +86,24 @@ func (u *orderUseCase) CreateOrder(ctx context.Context, customerID, itemName str
 		_, err = u.paymentClient.AuthorizePayment(bgCtx, orderID, amount)
 		if err != nil {
 			_ = u.repo.UpdateStatus(bgCtx, orderID, "Payment Failed")
+
+			_ = u.cache.InvalidateOrder(context.Background(), orderID)
+
 			u.broker.Publish(orderID, "Payment Failed")
 			return
 		}
 
 		_ = u.repo.UpdateStatus(bgCtx, orderID, "Paid")
+
+		_ = u.cache.InvalidateOrder(bgCtx, orderID)
+
 		u.broker.Publish(orderID, "Paid")
 	}(order.ID, order.Amount)
 
 	return order, nil
 }
 
-// Checkout — синхронная оплата (как мы договаривались)
 func (u *orderUseCase) Checkout(ctx context.Context, orderID string, customerID string, itemName string, amount int64) error {
-	// Проверяем, что заказ с этим ID не существует
 	existingOrder, err := u.repo.GetByID(ctx, orderID)
 	if err != nil {
 		return fmt.Errorf("failed to check existing order: %w", err)
@@ -113,14 +121,19 @@ func (u *orderUseCase) Checkout(ctx context.Context, orderID string, customerID 
 	if err != nil {
 		log.Printf("Payment failed for order %s: %v", orderID, err)
 		_ = u.repo.UpdateStatus(ctx, orderID, "FAILED")
+
+		_ = u.cache.InvalidateOrder(context.Background(), orderID)
 		return fmt.Errorf("payment authorization failed: %w", err)
 	}
 
-	// Предположим, у тебя есть метод UpdateOrderPaid или UpdateStatus
 	err = u.repo.UpdateOrderPaid(ctx, orderID, "Paid", transactionID)
 	if err != nil {
 		log.Printf("Failed to update status to PAID for order %s: %v", orderID, err)
 		return err
+	}
+
+	if cacheErr := u.cache.InvalidateOrder(context.Background(), orderID); cacheErr != nil {
+		log.Printf("Failed to invalidate order %s in cache: %v", orderID, cacheErr)
 	}
 
 	log.Printf("Order %s successfully processed and paid with TxID: %s", orderID, transactionID)
@@ -128,14 +141,25 @@ func (u *orderUseCase) Checkout(ctx context.Context, orderID string, customerID 
 }
 
 func (u *orderUseCase) GetOrder(ctx context.Context, id string) (*domain.Order, error) {
-	o, err := u.repo.GetByID(ctx, id)
+	cachedOrder, err := u.cache.GetOrder(ctx, id)
+	if err == nil && cachedOrder != nil {
+		log.Printf("Cache HIT for order: %s", id)
+		return cachedOrder, nil
+	}
+
+	log.Printf("Cache MISS for order: %s", id)
+	order, err := u.repo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if o == nil {
-		return nil, errors.New("order not found")
-	}
-	return o, nil
+
+	go func() {
+		if err := u.cache.SetOrder(context.Background(), order, u.ttl); err != nil {
+			log.Printf("Failed to cache order %s: %v", order.ID, err)
+		}
+	}()
+
+	return order, nil
 }
 
 func (u *orderUseCase) CancelOrder(ctx context.Context, id string) error {
@@ -156,6 +180,11 @@ func (u *orderUseCase) CancelOrder(ctx context.Context, id string) error {
 
 	err = u.repo.UpdateStatus(ctx, id, "Cancelled")
 	if err == nil {
+// Атомарная инвалидация кэша
+		if cacheErr := u.cache.InvalidateOrder(context.Background(), id); cacheErr != nil {
+			log.Printf("Failed to invalidate order %s in cache: %v", id, cacheErr)
+		}
+
 		u.broker.Publish(id, "Cancelled")
 	}
 

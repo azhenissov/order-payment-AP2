@@ -46,6 +46,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   payment-service:
     build:
       context: ./payment-service
@@ -73,6 +85,8 @@ services:
       context: ./order-service
     container_name: order-service
     depends_on:
+      redis:
+        condition: service_healthy
       order_db:
         condition: service_healthy
       payment-service:
@@ -82,6 +96,8 @@ services:
       ORDER_GRPC_PORT: :9091
       PAYMENT_GRPC_ADDRESS: payment-service:9090
       DATABASE_URL: "postgres://order_user:order_password@order_db:5432/orders_db?sslmode=disable"
+      REDIS_URL: "redis:6379"
+      CACHE_TTL_MINUTES: 5
     ports:
       - "8080:8080"
       - "9091:9091"
@@ -92,10 +108,14 @@ services:
       context: ./notification-service
     container_name: notification-service
     depends_on:
+      redis:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
     environment:
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      REDIS_URL: "redis:6379"
+      PROVIDER_MODE: "SIMULATED"
 volumes:
   order_data:
   payment_data:

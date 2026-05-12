@@ -1,19 +1,23 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"order-service/internal/api"
 	"order-service/internal/repository"
 	"order-service/internal/service"
+	"order-service/internal/api/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -77,15 +81,53 @@ func main() {
 
 	paymentGRPCClient := paymentDesc.NewPaymentAPIClient(paymentConn)
 
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		log.Println("Warning: REDIS_URL is empty, defaulting to redis:6379")
+		redisURL = "redis:6379"
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+
+	var redisErr error
+	for i := 0; i < 5; i++ {
+        ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+        redisErr = rdb.Ping(ctx).Err()
+        cancel()
+        
+        if redisErr == nil {
+            log.Println("✓ Redis connected successfully")
+            break
+        }
+        log.Printf("Failed to connect to Redis, retrying in 2s... (%d/5)", i+1)
+        time.Sleep(2 * time.Second)
+    }
+	if redisErr != nil {
+		log.Fatalf("Could not connect to Redis after %d attempts: %v", 5, redisErr)
+	}
+	defer rdb.Close()
+
+	ttlMinutesStr := os.Getenv("CACHE_TTL_MINUTES")
+    ttlMinutes, err := strconv.Atoi(ttlMinutesStr)
+    if err != nil || ttlMinutes <= 0 {
+        log.Println("Warning: Invalid CACHE_TTL_MINUTES, defaulting to 5")
+        ttlMinutes = 5
+    }
+
 	// 3. Setup Clean Architecture Layers
 	orderRepo := repository.NewPostgresOrderRepository(db)
 	paymentClient := api.NewGRPCPaymentClient(paymentGRPCClient)
 
+	orderCache := repository.NewRedisOrderCache(rdb)
 	// Инициализируем наш Брокер (один на всё приложение)
 	broker := service.NewOrderBroker()
 
 	// Передаем брокер в UseCase
-	orderUC := service.NewOrderUseCase(orderRepo, paymentClient, broker)
+	orderUC := service.NewOrderUseCase(orderRepo, paymentClient, broker, orderCache, ttlMinutes)
+
+
 
 	// 4. Start gRPC Server for Order Service (in separate goroutine)
 	grpcPort := os.Getenv("ORDER_GRPC_PORT")
@@ -117,10 +159,17 @@ func main() {
 	}
 
 	router := gin.Default()
+
+	limit := 10
+	window := 1*time.Minute
+
+	router.Use(middleware.RateLimiter(rdb, limit, window))
+
 	api.NewOrderHandler(router, orderUC)
 
 	log.Println()
 	log.Println("✓ External API: REST (Gin) - for users")
+	log.Println("✓ Rate Limiter: 10 requests per minute")
 	log.Println("✓ Internal API: gRPC - for service-to-service communication")
 	log.Println("✓ Streaming: Server-side streaming for order updates")
 	log.Println("  Proto Contracts: github.com/azhenissov/grpc-contracts-go/*_v1")
